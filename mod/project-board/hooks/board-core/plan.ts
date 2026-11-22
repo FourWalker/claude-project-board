@@ -23,6 +23,19 @@ export function nextStep(plan: string): PlanStep | null {
   return null;
 }
 
+/** How many of the plan's steps are ticked, out of all of them. */
+export function planProgress(plan: string): { readonly done: number; readonly total: number } {
+  let done = 0;
+  let total = 0;
+  for (const line of plan.split(/\r?\n/)) {
+    const m = STEP.exec(line);
+    if (!m) continue;
+    total++;
+    if (m[2] !== " ") done++;
+  }
+  return { done, total };
+}
+
 export function tickStep(plan: string, id: string): string {
   return plan
     .split(/\r?\n/)
