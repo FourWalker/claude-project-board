@@ -1,0 +1,11 @@
+{
+  "name": "project-board",
+  "owner": { "name": "Project Board" },
+  "plugins": [
+    {
+      "name": "project-board",
+      "source": "./mod/project-board",
+      "description": "A sticky-note board of the work your Claude chats do, across workspace copies: tasks in 3 levels, plans, living handoffs, decisions and a recommendations register, with Board Mode guiding each chat."
+    }
+  ]
+}

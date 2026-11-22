@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Project Board</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <meta name="theme-color" content="#1d1c1a">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" class="logo" aria-hidden="true"><rect x="3" y="3" width="8" height="8" rx="1.5"/><rect x="13" y="3" width="8" height="5" rx="1.5"/><rect x="13" y="10" width="8" height="11" rx="1.5"/><rect x="3" y="13" width="8" height="8" rx="1.5"/></svg>
+      <div>
+        <h1><span id="projectName">Project Board</span> <a href="/" class="switch" title="Open another project's board">Switch project ▾</a></h1>
+        <div id="workspaces" class="chips"></div>
+      </div>
+    </div>
+    <div class="top-actions">
+      <div id="collision" class="collision" hidden></div>
+      <div class="seg" id="viewMode" title="Display">
+        <button data-v="tree" class="on">Tree</button>
+        <button data-v="1">Level 1</button>
+        <button data-v="2">Level 2</button>
+        <button data-v="3">Level 3</button>
+        <button data-v="svc">By service</button>
+        <button data-v="register">Register</button>
+      </div>
+      <div class="seg" id="filter">
+        <button data-f="active" class="on">Active</button>
+        <button data-f="paused">Paused</button>
+        <button data-f="done">Done</button>
+        <button data-f="all">All</button>
+      </div>
+      <button class="btn primary" id="newTask">+ New task</button>
+      <button class="icon-btn" id="settingsBtn" title="Settings" aria-label="Settings">⚙</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section id="board" class="board" aria-label="Tasks"></section>
+    <aside class="panel" id="panel" aria-label="Important"></aside>
+  </main>
+
+  <section id="page" class="page" hidden aria-label="Master task"></section>
+  <section id="picker" class="picker" hidden></section>
+
+  <div id="scrim" class="scrim" hidden></div>
+  <article id="detail" class="detail" hidden aria-modal="true" role="dialog"></article>
+
+  <dialog id="settings">
+    <form method="dialog" class="settings">
+      <h2>Board</h2>
+      <label>Board name <input name="boardName" spellcheck="false"></label>
+      <div>
+        <div class="small muted" style="margin-bottom:6px">Workspaces: the root folder of each copy. A chat whose folder is inside one of these belongs to this board.</div>
+        <div id="rootsList"></div>
+        <div class="root-add">
+          <input name="newRoot" placeholder="D:\path\to\workspace" spellcheck="false">
+          <input name="newLabel" placeholder="Label" spellcheck="false">
+          <button type="button" class="btn small" data-addroot>Add</button>
+        </div>
+      </div>
+      <label class="row"><input type="checkbox" name="boardMode"> <span><b>Board Mode</b> — chats in these workspaces follow the board protocol: resume from the living handoff, checkpoint at phase ends, token hygiene, decisions filed at the right level.</span></label>
+      <label>Services <small>— one per line: <code>id | Name | folder pattern, …</code>. A file belongs to a service when its path contains the pattern.</small>
+        <textarea name="services" rows="7" spellcheck="false" class="mono" style="font-size:12px"></textarea>
+      </label>
+      <label>Project rules <small>— sent to every Board Mode chat on this board (build/test rules, environment facts, team conventions)</small>
+        <textarea name="rules" rows="6" spellcheck="false" style="font-size:12.5px"></textarea>
+      </label>
+      <label>Existing registers <small>— one per line: <code>topic | URL</code>. Recommendations on these topics are written there too, with the same R#.</small>
+        <textarea name="registers" rows="2" spellcheck="false" class="mono" style="font-size:12px"></textarea>
+      </label>
+      <h2 style="margin-top:6px">App</h2>
+      <label>Jump link for desktop chats <small>({id} = chat id)</small>
+        <input name="jumpUrl" spellcheck="false">
+      </label>
+      <label class="row"><input type="checkbox" name="openWorkspaceInVSCode"> Also open the chat's workspace in VS Code when jumping</label>
+      <div class="row end">
+        <button value="cancel" class="btn">Cancel</button>
+        <button value="save" class="btn primary">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="moveDlg">
+    <form method="dialog" class="settings">
+      <h2>Move</h2>
+      <p class="muted" id="moveInfo" style="margin:0"></p>
+      <label>New place <select name="dest"></select></label>
+      <div class="row end">
+        <button value="cancel" class="btn">Cancel</button>
+        <button value="move" class="btn primary">Move</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="resume">
+    <form method="dialog" class="settings">
+      <h2>Resume this chat</h2>
+      <p class="muted" style="margin:0">No link can open this chat: it ran in a terminal, or it started before the board mod could record where it runs (restarting it fixes that). To continue it from a terminal, run this <span class="ws"></span>:</p>
+      <code class="resume-cmd"></code>
+      <div class="row end">
+        <button type="button" class="btn" data-openws hidden>Open workspace in VS Code</button>
+        <button type="button" class="btn" data-copyresume>Copy command</button>
+        <button value="close" class="btn primary">Done</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,25 @@
+{
+  "name": "project-board-bridge",
+  "displayName": "Project Board Bridge",
+  "description": "Opens Claude chats from the Claude Project Board in the Claude sidebar instead of a full editor tab.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "engines": { "vscode": "^1.90.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onUri"],
+  "main": "./extension.js",
+  "extensionDependencies": ["anthropic.claude-code"],
+  "contributes": {
+    "configuration": {
+      "title": "Project Board",
+      "properties": {
+        "projectBoard.openChatsIn": {
+          "type": "string",
+          "enum": ["sidebar", "tab"],
+          "default": "sidebar",
+          "description": "Where chats opened from the Project Board appear: the Claude sidebar, or a full editor tab."
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "name": "project-board",
+  "version": "0.1.0",
+  "description": "Reports each chat's task, status, last action, plan and handoffs to the Claude Project Board."
+}
