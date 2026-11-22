@@ -7,7 +7,7 @@
 import { nextStep, planProgress, type PlanStep } from "./plan.ts";
 import type { BoardStore } from "./store.ts";
 import { norm } from "./text.ts";
-import type { Level, Session, Task, TaskStatus } from "./types.ts";
+import type { Decision, Item, Level, Owner, Session, Task, TaskLink, TaskStatus } from "./types.ts";
 
 /** The board app marks a chat offline after this long without a heartbeat. */
 export const OFFLINE_MS = 2.5 * 60 * 1000;
@@ -30,6 +30,19 @@ export interface BoardViewChat {
   /** Set for T3 threads: the thread to open. */
   readonly threadId: string | null;
   readonly provider: string | null;
+  /** When the chat's current (or last) turn started; 0 before its first. */
+  readonly turnStartedAt: number;
+}
+
+/** A decision as the board screen lists it; its full text is read with the task. */
+export interface BoardViewDecision {
+  readonly id: string;
+  readonly title: string;
+  readonly status: Decision["status"];
+  readonly level: Level;
+  readonly raisedFrom: { readonly id: string; readonly title: string } | null;
+  /** The recommendation's R#, when the decision is one. */
+  readonly r: string | null;
 }
 
 export interface BoardViewTask {
@@ -39,15 +52,26 @@ export interface BoardViewTask {
   readonly status: TaskStatus;
   readonly level: Level;
   readonly parentId: string | null;
+  /** Level 1 only: a feature or a service backlog. */
+  readonly kind: "feature" | "backlog" | null;
+  readonly bug: boolean;
+  readonly mainService: string | null;
   readonly services: ReadonlyArray<string>;
   readonly lastAction: {
     readonly text: string;
     readonly at: number;
     readonly workspaceLabel: string;
+    readonly sessionId: string;
   } | null;
   readonly next: PlanStep | null;
   readonly steps: { readonly done: number; readonly total: number };
   readonly chats: ReadonlyArray<BoardViewChat>;
+  readonly items: ReadonlyArray<Pick<Item, "id" | "kind" | "text" | "done">>;
+  readonly decisions: ReadonlyArray<BoardViewDecision>;
+  readonly links: ReadonlyArray<Pick<TaskLink, "to" | "type" | "note">>;
+  /** Set on the module or master task itself; tasks inherit it (see `ownerRoot`). */
+  readonly owner: Pick<Owner, "root" | "label" | "state"> | null;
+  readonly createdAt: number;
   readonly updatedAt: number;
   /** The root of the workspace copy that owns the task's module or master task, if one does. */
   readonly ownerRoot: string | null;
@@ -56,7 +80,12 @@ export interface BoardViewTask {
 export interface BoardView {
   readonly id: string;
   readonly name: string;
-  readonly services: ReadonlyArray<{ readonly id: string; readonly name: string }>;
+  readonly boardMode: boolean;
+  readonly services: ReadonlyArray<{
+    readonly id: string;
+    readonly name: string;
+    readonly match: ReadonlyArray<string>;
+  }>;
   /** Each copy of the project the board spans: the folders a thread can work on its tasks in. */
   readonly workspaces: ReadonlyArray<{ readonly label: string; readonly root: string }>;
   readonly tasks: ReadonlyArray<BoardViewTask>;
@@ -76,6 +105,7 @@ const chatOf = (s: Session, now: number): BoardViewChat => ({
   updatedAt: s.updatedAt,
   threadId: s.source?.kind === "t3-thread" ? s.source.threadId : null,
   provider: s.source?.kind === "t3-thread" ? (s.source.provider ?? null) : null,
+  turnStartedAt: s.turnStartedAt || 0,
 });
 
 export async function readBoardSummaries(store: BoardStore): Promise<BoardSummary[]> {
@@ -124,17 +154,35 @@ export async function readBoardView(
         status: t.status,
         level: t.level === 2 || t.level === 3 ? t.level : 1,
         parentId: t.parentId ?? null,
+        kind: t.level === 2 || t.level === 3 ? null : t.kind === "backlog" ? "backlog" : "feature",
+        bug: !!t.bug,
+        mainService: t.mainService ?? null,
         services: t.services ?? [],
         lastAction: t.lastAction
           ? {
               text: t.lastAction.text,
               at: t.lastAction.at,
               workspaceLabel: t.lastAction.workspaceLabel,
+              sessionId: t.lastAction.sessionId,
             }
           : null,
         next: nextStep(plan),
         steps: planProgress(plan),
         chats: chats.filter((c) => c.taskId === t.id),
+        items: t.items.map((i) => ({ id: i.id, kind: i.kind, text: i.text, done: i.done })),
+        decisions: (t.decisions ?? []).map((d) => ({
+          id: d.id,
+          title: d.title,
+          status: d.status,
+          level: d.level || (t.level === 2 || t.level === 3 ? t.level : 1),
+          raisedFrom: d.raisedFrom ?? null,
+          r: d.rec?.r ?? null,
+        })),
+        links: (t.links ?? []).map((l) => ({ to: l.to, type: l.type, note: l.note })),
+        owner: t.owner
+          ? { root: norm(t.owner.root), label: t.owner.label, state: t.owner.state }
+          : null,
+        createdAt: t.createdAt,
         updatedAt: t.updatedAt,
         ownerRoot: ownerRoot(t),
       };
@@ -143,7 +191,8 @@ export async function readBoardView(
   return {
     id: board.id,
     name: board.name,
-    services: (board.services ?? []).map((s) => ({ id: s.id, name: s.name })),
+    boardMode: !!board.boardMode,
+    services: (board.services ?? []).map((s) => ({ id: s.id, name: s.name, match: s.match })),
     workspaces: board.roots.map((r) => ({ label: r.label, root: norm(r.path) })),
     tasks: tasks.toSorted((a, b) => b.updatedAt - a.updatedAt),
     unlinked: chats.filter((c) => c.taskId === null && c.live !== "ended"),

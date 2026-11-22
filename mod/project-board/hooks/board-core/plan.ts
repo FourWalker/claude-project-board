@@ -61,6 +61,24 @@ export function markStepDelegated(plan: string, stepId: string, taskId: string):
     .join("\n");
 }
 
+/**
+ * Ticks (or, for a reopened subtask, unticks) the parent steps a subtask took over: the ones
+ * marked `→ (task <id>)`.
+ */
+export function setDelegatedDone(plan: string, taskId: string, done: boolean): string {
+  const marker = `→ (task ${taskId})`;
+  return plan
+    .split(/\r?\n/)
+    .map((line) =>
+      STEP.test(line) && line.trimEnd().endsWith(marker)
+        ? done
+          ? line.replace(/\[ \]/, "[x]")
+          : line.replace(/\[[xX]\]/, "[ ]")
+        : line,
+    )
+    .join("\n");
+}
+
 /** The `Objective:` / `Goal:` line of a handoff or plan, else its first paragraph. */
 export const objectiveLine = (md: string): string =>
   (

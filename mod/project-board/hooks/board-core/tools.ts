@@ -315,6 +315,11 @@ export const SCHEMA = {
       },
       lastAction: { type: "string", description: "Optional one-line summary for the board note." },
       markStepDone: { type: "boolean", description: "Tick the step in plan.md (default true)." },
+      handoff: {
+        type: "string",
+        description:
+          "The WHOLE rewritten living handoff, saved in the same call (same shape as board_checkpoint). Pass it whenever a step finishes, so the handoff and the checklist never disagree.",
+      },
     },
     required: ["step", "markdown"],
   },
@@ -359,7 +364,8 @@ export const BOARD_TOOLS: ReadonlyArray<BoardToolDefinition> = [
   },
   {
     name: "board_handoff",
-    description: "Write the handoff note for a finished plan step and tick it in the plan.",
+    description:
+      "Finish a plan step in one call: write its step note, tick it in the plan, and (with handoff) rewrite the living handoff.",
     inputSchema: SCHEMA.handoff,
   },
   {

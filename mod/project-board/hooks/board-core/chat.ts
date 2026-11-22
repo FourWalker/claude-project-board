@@ -7,7 +7,7 @@
  * @module board-core/chat
  */
 import type { BoardGit } from "./io.ts";
-import { markStepDelegated, nextStep, objectiveLine, tickStep } from "./plan.ts";
+import { markStepDelegated, nextStep, objectiveLine, setDelegatedDone, tickStep } from "./plan.ts";
 import { type BoardHost, boardModeProtocol, resumeHint, toolRules } from "./protocol.ts";
 import { BoardStore, LEVEL_NAME, findBoard, levelOf } from "./store.ts";
 import {
@@ -440,26 +440,28 @@ export class BoardChat {
     ];
     if (open.length)
       lines.push("Open items:", ...open.map((i) => `- [${i.kind}] ${i.text} (id ${i.id})`));
+    // Binding decisions first: a long list of open questions must never push a verdict out.
     const decs: string[] = [];
+    for (const d of t.decisions ?? [])
+      if (d.status === "decided")
+        decs.push(`- ${d.id} [L${d.level}, decided] ${d.title} → ${clip(d.verdict, 140)}`);
+    for (const a of anc)
+      for (const d of a.decisions ?? [])
+        if (d.status === "decided")
+          decs.push(
+            `- ${d.id} [L${d.level} on "${a.title}", decided] ${d.title} → ${clip(d.verdict, 140)}`,
+          );
     for (const d of t.decisions ?? [])
       if (d.status === "open")
         decs.push(
           `- ${d.id} [L${d.level}, open] ${d.title}${d.raisedFrom ? ` (raised in ${d.raisedFrom.title})` : ""}`,
         );
     for (const a of anc)
-      for (const d of a.decisions ?? []) {
+      for (const d of a.decisions ?? [])
         if (d.status === "open")
           decs.push(
             `- ${d.id} [L${d.level} on "${a.title}", open] ${d.title}${d.raisedFrom?.id === t.id ? " (raised here)" : ""}`,
           );
-        else if (d.status === "decided")
-          decs.push(
-            `- ${d.id} [L${d.level} on "${a.title}", decided] ${d.title} → ${clip(d.verdict, 140)}`,
-          );
-      }
-    for (const d of t.decisions ?? [])
-      if (d.status === "decided")
-        decs.push(`- ${d.id} [L${d.level}, decided] ${d.title} → ${clip(d.verdict, 140)}`);
     if (decs.length)
       lines.push(
         "Decisions bearing on this task (decided ones are binding; open ones are not settled):",
@@ -861,7 +863,9 @@ When linked, the tool returns the task's plan and handoff: continue from them.`;
     }
     if (a.description) t.description = str(a.description);
     if (a.title) t.title = str(a.title);
+    const wasDone = t.status === "done";
     if (a.status === "active" || a.status === "paused" || a.status === "done") t.status = a.status;
+    const delegated = wasDone !== (t.status === "done") ? await this.syncDelegatedSteps(t) : [];
     if (Array.isArray(a.services)) t.services = [...new Set(a.services.map(String))];
     if (a.mainService !== undefined) t.mainService = a.mainService ? str(a.mainService) : null;
     if (a.kind === "feature" || a.kind === "backlog") t.kind = a.kind;
@@ -905,8 +909,27 @@ When linked, the tool returns the task's plan and handoff: continue from them.`;
     await this.saveTask(t);
     await this.rebuildContext();
     return reply(
-      `Board updated for "${t.title}". Open items: ${t.items.filter((i) => !i.done).length}.`,
+      `Board updated for "${t.title}". Open items: ${t.items.filter((i) => !i.done).length}.${delegated.length ? ` ${t.status === "done" ? "Ticked" : "Reopened"} the parent step it took over (${delegated.join(", ")}).` : ""}`,
     );
+  }
+
+  /**
+   * A subtask that took over a parent plan step finishes that step when it's done, and reopens
+   * it when it's reopened, so the parent's next step never points at finished work.
+   */
+  private async syncDelegatedSteps(t: Task): Promise<string[]> {
+    if (!t.parentId) return [];
+    const path = this.store.planPath(this.boardId, t.parentId);
+    const plan = await this.store.readText(path);
+    const updated = setDelegatedDone(plan, t.id, t.status === "done");
+    if (updated === plan) return [];
+    await this.store.io.write(path, updated);
+    const before = plan.split(/\r?\n/);
+    return updated
+      .split(/\r?\n/)
+      .filter((line, i) => line !== before[i])
+      .map((line) => nextStep(line.replace(/\[[xX]\]/, "[ ]"))?.id ?? "")
+      .filter(Boolean);
   }
 
   async savePlan(a: Record<string, unknown>): Promise<BoardReply> {
@@ -926,7 +949,12 @@ When linked, the tool returns the task's plan and handoff: continue from them.`;
     return `${this.host === "t3" ? "thread" : "chat"} ${s?.sessionId ?? "?"} in ${s?.workspaceLabel ?? "?"}${s?.subfolder ? `/${s.subfolder}` : ""}`;
   }
 
-  async writeHandoff(a: Record<string, unknown>): Promise<BoardReply> {
+  /**
+   * Finishes a plan step in one call: the step note, the rewritten living handoff (when given)
+   * and the tick, so an interrupted chat never leaves the checklist and the handoff pointing at
+   * different next actions. Safe to retry: every write replaces, and ticking is idempotent.
+   */
+  async writeHandoff(a: Record<string, unknown>, t3Checkpoint?: string): Promise<BoardReply> {
     const t = await this.requireTask(a);
     if (typeof t === "string") return reply(t);
     const step = safeFileName(str(a.step)) || `note-${this.now()}`;
@@ -936,6 +964,8 @@ When linked, the tool returns the task's plan and handoff: continue from them.`;
       this.store.stepHandoffPath(this.boardId, t.id, step),
       header + str(a.markdown),
     );
+    const living = str(a.handoff).trim();
+    const repos = living ? await this.writeLiving(t, living, t3Checkpoint) : [];
     let plan = await this.readPlan(t.id);
     if (plan && a.markStepDone !== false) {
       plan = tickStep(plan, step);
@@ -949,7 +979,11 @@ When linked, the tool returns the task's plan and handoff: continue from them.`;
     await this.rebuildContext();
     const nx = nextStep(plan);
     return reply(
-      `Handoff ${step} saved.${nx ? ` Next step: ${nx.id} – ${nx.text}.` : " No unticked steps left."}`,
+      `Handoff ${step} saved.${nx ? ` Next step: ${nx.id} – ${nx.text}.` : " No unticked steps left."}${
+        living
+          ? ` Living handoff rewritten: ${this.livingPath(t.id)}.${repos.length ? `\nRepo state recorded:\n${repos.map((r) => `- ${repoLine(r)}`).join("\n")}` : ""}`
+          : " The living handoff was not rewritten and still describes the state before this step: pass handoff next time, or rewrite it now with board_checkpoint."
+      }`,
     );
   }
 
@@ -1048,11 +1082,7 @@ When linked, the tool returns the task's plan and handoff: continue from them.`;
     if (typeof t === "string") return reply(t);
     const md = str(a.markdown).trim();
     if (!md) return reply("markdown is empty: nothing saved.");
-    const header = `<!-- living handoff, rewritten in place · last by ${this.byLine()}, ${stamp(this.now())}${t3Checkpoint ? ` · checkpoint ${t3Checkpoint}` : ""} -->\n`;
-    await this.store.io.write(this.livingPath(t.id), header + md + "\n");
-    const repos = await this.reposFor(t).catch(() => [] as RepoState[]);
-    if (repos.length) t.repoState = repos;
-    this.pickupNote = "";
+    const repos = await this.writeLiving(t, md, t3Checkpoint);
     if (a.lastAction) {
       t.lastAction = this.lastAction(str(a.lastAction));
       this.lastActionSetThisTurn = true;
@@ -1062,6 +1092,16 @@ When linked, the tool returns the task's plan and handoff: continue from them.`;
     return reply(
       `Living handoff saved: ${this.livingPath(t.id)}${repos.length ? `\nRepo state recorded:\n${repos.map((r) => `- ${repoLine(r)}`).join("\n")}` : ""}\n${resumeHint(this.host, t.id)}`,
     );
+  }
+
+  /** Rewrites the living handoff and records repo state on `t` (the caller saves the task). */
+  private async writeLiving(t: Task, md: string, t3Checkpoint?: string): Promise<RepoState[]> {
+    const header = `<!-- living handoff, rewritten in place · last by ${this.byLine()}, ${stamp(this.now())}${t3Checkpoint ? ` · checkpoint ${t3Checkpoint}` : ""} -->\n`;
+    await this.store.io.write(this.livingPath(t.id), header + md + "\n");
+    const repos = await this.reposFor(t).catch(() => [] as RepoState[]);
+    if (repos.length) t.repoState = repos;
+    this.pickupNote = "";
+    return repos;
   }
 
   async fileDecision(a: Record<string, unknown>): Promise<BoardReply> {
@@ -1384,7 +1424,7 @@ When linked, the tool returns the task's plan and handoff: continue from them.`;
       case "board_plan":
         return this.savePlan(args);
       case "board_handoff":
-        return this.writeHandoff(args);
+        return this.writeHandoff(args, extra?.t3Checkpoint);
       case "board_create_task":
         return this.createTask(args);
       case "board_decision":
