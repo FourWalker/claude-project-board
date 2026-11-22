@@ -7,7 +7,17 @@
 import { nextStep, planProgress, type PlanStep } from "./plan.ts";
 import type { BoardStore } from "./store.ts";
 import { norm } from "./text.ts";
-import type { Decision, Item, Level, Owner, Session, Task, TaskLink, TaskStatus } from "./types.ts";
+import type {
+  Decision,
+  Item,
+  Level,
+  Owner,
+  Session,
+  Task,
+  TaskDoc,
+  TaskLink,
+  TaskStatus,
+} from "./types.ts";
 
 /** The board app marks a chat offline after this long without a heartbeat. */
 export const OFFLINE_MS = 2.5 * 60 * 1000;
@@ -196,5 +206,73 @@ export async function readBoardView(
     workspaces: board.roots.map((r) => ({ label: r.label, root: norm(r.path) })),
     tasks: tasks.toSorted((a, b) => b.updatedAt - a.updatedAt),
     unlinked: chats.filter((c) => c.taskId === null && c.live !== "ended"),
+  };
+}
+
+/** One task's documents as its task views show them: the texts the board screen leaves out. */
+export interface BoardTaskDetail {
+  /** The master implementation plan of the task's master task (its own, for a master task). */
+  readonly masterPlan: string;
+  readonly masterTaskId: string;
+  readonly plan: string;
+  /** The living handoff, without its header comment. */
+  readonly handoff: string;
+  readonly latestNote: { readonly step: string; readonly text: string } | null;
+  readonly docs: ReadonlyArray<Pick<TaskDoc, "id" | "kind" | "title" | "ref" | "note">>;
+  /** Decisions filed on this task, and on its parents when raised here. */
+  readonly decisions: ReadonlyArray<
+    Pick<Decision, "id" | "title" | "description" | "options" | "verdict" | "status" | "level"> & {
+      readonly r: string | null;
+      readonly filedOn: { readonly id: string; readonly title: string };
+    }
+  >;
+}
+
+const stripHeader = (md: string) => md.replace(/^<!--[\s\S]*?-->\s*/, "");
+
+export async function readTaskDetail(
+  store: BoardStore,
+  boardId: string,
+  taskId: string,
+): Promise<BoardTaskDetail | null> {
+  const task = await store.loadTask(boardId, taskId);
+  if (!task) return null;
+  const ancestors = await store.ancestorsOf(boardId, task);
+  const master = ancestors[0] ?? task;
+  const [masterPlan, plan, handoff, latestNote] = await Promise.all([
+    store.readText(store.masterPath(boardId, master.id)),
+    store.readText(store.planPath(boardId, task.id)),
+    store.readText(store.livingPath(boardId, task.id)),
+    store.latestHandoff(boardId, task.id),
+  ]);
+  const decisions = [task, ...ancestors].flatMap((owner) =>
+    (owner.decisions ?? [])
+      .filter((d) => owner.id === task.id || d.raisedFrom?.id === task.id)
+      .map((d) => ({
+        id: d.id,
+        title: d.title,
+        description: d.description,
+        options: d.options,
+        verdict: d.verdict,
+        status: d.status,
+        level: d.level,
+        r: d.rec?.r ?? null,
+        filedOn: { id: owner.id, title: owner.title },
+      })),
+  );
+  return {
+    masterPlan,
+    masterTaskId: master.id,
+    plan,
+    handoff: stripHeader(handoff),
+    latestNote: latestNote ? { step: latestNote.step, text: stripHeader(latestNote.text) } : null,
+    docs: (task.docs ?? []).map((d) => ({
+      id: d.id,
+      kind: d.kind,
+      title: d.title,
+      ref: d.ref,
+      note: d.note,
+    })),
+    decisions,
   };
 }

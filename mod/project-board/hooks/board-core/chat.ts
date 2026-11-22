@@ -7,7 +7,14 @@
  * @module board-core/chat
  */
 import type { BoardGit } from "./io.ts";
-import { markStepDelegated, nextStep, objectiveLine, setDelegatedDone, tickStep } from "./plan.ts";
+import {
+  markStepDelegated,
+  nextStep,
+  objectiveLine,
+  planProgress,
+  setDelegatedDone,
+  tickStep,
+} from "./plan.ts";
 import { type BoardHost, boardModeProtocol, resumeHint, toolRules } from "./protocol.ts";
 import { BoardStore, LEVEL_NAME, findBoard, levelOf } from "./store.ts";
 import {
@@ -46,6 +53,11 @@ export interface BoardReply {
 export interface OpenChatInput {
   readonly sessionId: string;
   readonly cwd: string;
+  /**
+   * The project folder `cwd` belongs to, when it can sit outside it (a T3 worktree): the chat
+   * goes on that folder's board when `cwd` itself is on none.
+   */
+  readonly projectRoot?: string | undefined;
   /** The host app's own id for the chat, when it can give the same chat a new engine id. */
   readonly hostSessionId?: string | undefined;
   readonly surface?: string | undefined;
@@ -54,6 +66,10 @@ export interface OpenChatInput {
 
 // VS Code's placeholder folder for untrusted workspaces, and similar: never reported.
 const IGNORED = /\/globalStorage\/|\/untrusted-start(\/|$)/i;
+/** How many recently active tasks an unlinked chat sees; the rest are a board_find away. */
+const UNLINKED_TASKS = 8;
+/** The living handoff's share of a T3 thread's resume summary. */
+const RESUME_HANDOFF_CHARS = 3000;
 
 const reply = (text: string, toast?: string): BoardReply => (toast ? { text, toast } : { text });
 const str = (v: unknown, fallback = ""): string =>
@@ -83,6 +99,7 @@ export class BoardChat {
   /** Shown to a chat that just took over a soft-released module, until it checkpoints. */
   pickupNote = "";
   private readonly warnedServices = new Set<string>();
+  private projectRoot: string | undefined;
 
   constructor(store: BoardStore, git: BoardGit, host: BoardHost) {
     this.store = store;
@@ -133,13 +150,17 @@ export class BoardChat {
   async resolve(): Promise<void> {
     if (!this.sess) return;
     const reg = await this.store.loadRegistry();
-    const hit = findBoard(reg, this.sess.cwd);
+    const hit =
+      findBoard(reg, this.sess.cwd) ??
+      (this.projectRoot === undefined ? null : findBoard(reg, this.projectRoot));
     const wasUnassigned = !this.board;
     const oldPath = this.store.sessionPath(this.board?.id ?? null, this.sess.sessionId);
     this.board = hit?.board ?? null;
     if (hit) {
       const rp = norm(hit.root.path);
-      const sub = norm(this.sess.cwd).slice(rp.length).replace(/^\//, "");
+      const sub = isInside(this.sess.cwd, rp)
+        ? norm(this.sess.cwd).slice(rp.length).replace(/^\//, "")
+        : "";
       this.sess = {
         ...this.sess,
         projectId: hit.board.id,
@@ -199,6 +220,7 @@ export class BoardChat {
   /** Session start: load or create the chat's record and build its context. */
   async open(input: OpenChatInput): Promise<void> {
     const where = norm(input.cwd);
+    this.projectRoot = input.projectRoot;
     this.ignored = IGNORED.test(where + "/");
     if (this.ignored) return;
     const { sessionId, hostSessionId } = input;
@@ -399,7 +421,10 @@ export class BoardChat {
     for (const svc of this.board?.services ?? [])
       if (ids.has(svc.id))
         for (const m of svc.match) {
-          const dir = `${this.sess?.workspace}/${m}`;
+          // A worktree outside the board's root holds its own copy of each service folder.
+          const s = this.sess;
+          const copy = s && !isInside(s.cwd, s.workspace) ? s.cwd : s?.workspace;
+          const dir = `${copy}/${m}`;
           if (!(await this.store.io.exists(dir).catch(() => false))) continue;
           const st = await this.git.state(dir);
           if (st && !seen.has(st.repo)) seen.set(st.repo, { ...st, service: svc.id });
@@ -618,7 +643,9 @@ Before creating any task, ask the person ONE question: create a new board (ask f
     if (s.taskId) {
       const t = await this.loadTask(s.taskId);
       if (t) {
-        this.context = `${head}\nThis ${chat} is linked to a task. Continue from the plan and the latest handoff below without asking the person to re-explain them.\n\n${await this.describeTask(t, true)}\n\n${toolRules(this.host)}`;
+        const body =
+          this.host === "t3" ? await this.resumeSummary(t) : await this.describeTask(t, true);
+        this.context = `${head}\nThis ${chat} is linked to a task. Continue from the plan and the latest handoff below without asking the person to re-explain them.\n\n${body}\n\n${toolRules(this.host)}`;
         return;
       }
     }
@@ -626,17 +653,82 @@ Before creating any task, ask the person ONE question: create a new board (ask f
       this.context = `${head}\nThis ${chat} is not linked to a board task (the person chose not to). Don't ask about linking again; board_link is there if they ask.`;
       return;
     }
-    const tasks = (await this.listTasks()).filter((t) => t.status !== "done");
-    const list = await Promise.all(
-      tasks.map(async (t) => {
+    // Finding a task shouldn't cost what working on one does: the most recent few, and search.
+    const tasks = (await this.listTasks())
+      .filter((t) => t.status !== "done")
+      .toSorted((a, b) => b.updatedAt - a.updatedAt);
+    const recent = await Promise.all(
+      tasks.slice(0, UNLINKED_TASKS).map(async (t) => {
         const nx = nextStep(await this.readPlan(t.id));
         return `- ${t.id}: ${t.title}${nx ? ` (next: ${nx.id} – ${nx.text})` : ""}`;
       }),
     );
+    const more =
+      tasks.length > recent.length
+        ? `\n…and ${tasks.length - recent.length} more: search them with board_find before creating one.`
+        : "";
     this.context = `${head}
-This ${chat} is not linked to a board task yet.${list.length ? `\nActive tasks on the board:\n${list.join("\n")}` : " The board has no active tasks."}
+This ${chat} is not linked to a board task yet.${recent.length ? `\nRecently active tasks on the board:\n${recent.join("\n")}${more}` : " The board has no active tasks."}
 Once you understand what the person is working on: if it clearly matches an active task, ask once "Link this ${chat} to <task>?"; if it is new multi-step work, offer once to create a task for it. On yes call board_link; on no call board_link with decline: true. Don't ask for one-off questions.
 When linked, the tool returns the task's plan and handoff: continue from them.`;
+  }
+
+  /**
+   * A linked T3 thread's resume summary: what the next turn needs to act, with the rest a
+   * board_read away. Blockers, binding decisions and the next action lead; the living handoff
+   * follows within a fixed budget.
+   */
+  private async resumeSummary(t: Task): Promise<string> {
+    const plan = await this.readPlan(t.id);
+    const next = nextStep(plan);
+    const anc = await this.store.ancestorsOf(this.boardId, t);
+    const owner = (await this.ownerHolder(t))?.owner;
+    const blockers = (
+      await Promise.all(
+        (t.links ?? [])
+          .filter((l) => l.type === "blocked_by")
+          .map(async (l) => {
+            const o = await this.loadTask(l.to);
+            if (o?.status === "done") return null;
+            const ws = o ? (await this.ownerHolder(o))?.owner?.label : undefined;
+            return `- Blocked by "${o?.title ?? l.to}" (${l.to}${ws ? `, workspace ${ws}` : ""})${l.note ? ` — ${clip(l.note, 120)}` : ""}`;
+          }),
+      )
+    ).filter((x) => x !== null);
+    const decided = [t, ...anc]
+      .flatMap((x) => (x.decisions ?? []).filter((d) => d.status === "decided"))
+      .slice(0, 10)
+      .map((d) => `- ${d.title} → ${clip(d.verdict || "decided", 200)}`);
+    const required = t.items
+      .filter((i) => !i.done && i.kind === "mandatory")
+      .slice(0, 5)
+      .map((i) => `- ${clip(i.text, 180)}`);
+    const living = (await this.store.readText(this.livingPath(t.id)))
+      .replace(/<!--[\s\S]*?-->/g, "")
+      .trim();
+    const ho = living ? null : await this.store.latestHandoff(this.boardId, t.id);
+    const progress = planProgress(plan);
+    const lines = [
+      `### Task: ${t.title} (id ${t.id}, Level ${levelOf(t)}, ${t.status})`,
+      t.description && `Purpose: ${clip(t.description, 350)}`,
+      anc.length > 0 && `Under: ${anc.map((a) => a.title).join(" › ")}`,
+      owner && `Owner: workspace ${owner.label}${owner.state === "soft" ? " (soft-released)" : ""}`,
+      next
+        ? `Next action: ${next.id} – ${next.text} (step ${progress.done + 1} of ${progress.total}). The plan's checklist is authoritative if the handoff below disagrees.`
+        : plan
+          ? "Next action: every plan step is done; confirm with the person what's left."
+          : "No plan yet: write one with board_plan before starting multi-step work.",
+      blockers.length > 0 && `Open blockers:\n${blockers.slice(0, 5).join("\n")}`,
+      decided.length > 0 && `Binding decisions:\n${decided.join("\n")}`,
+      required.length > 0 && `Must-dos:\n${required.join("\n")}`,
+      t.lastAction &&
+        `Last action (${t.lastAction.workspaceLabel}): ${clip(t.lastAction.text, 260)}`,
+      living
+        ? `### Living handoff\n${clip(living, RESUME_HANDOFF_CHARS)}`
+        : ho && `### Latest step note (${ho.step})\n${clip(ho.text, RESUME_HANDOFF_CHARS)}`,
+      `More with board_read: the full plan, open decisions, step notes, parents. Living handoff: ${this.livingPath(t.id)}`,
+    ];
+    return lines.filter(Boolean).join("\n");
   }
 
   async rebuildContext(): Promise<void> {
