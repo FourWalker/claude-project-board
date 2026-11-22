@@ -12,6 +12,8 @@ import {
   addDecision,
   createTask,
   findDecision,
+  moveTask,
+  promoteTask,
   setTaskLink,
   settleDecision,
   syncDelegatedSteps,
@@ -36,7 +38,6 @@ import type {
   Board,
   Decision,
   ItemKind,
-  Level,
   LinkType,
   RepoState,
   Service,
@@ -1106,22 +1107,16 @@ When linked, the tool returns the task's plan and handoff: continue from them.`;
   async promoteTask(a: Record<string, unknown>): Promise<BoardReply> {
     const t = await this.requireTask(a);
     if (typeof t === "string") return reply(t);
-    const lv = levelOf(t);
-    if (lv === 1) return reply(`"${t.title}" is already a master task.`);
-    const par = t.parentId ? await this.loadTask(t.parentId) : null;
-    t.origin = [...(t.origin ?? []), ...(par ? [{ id: par.id, title: par.title }] : [])];
-    t.parentId = par?.parentId ?? null;
-    t.level = (lv - 1) as Level;
-    for (const d of t.decisions ?? []) if (d.level === lv) d.level = t.level;
-    await this.saveTask(t);
-    // Its subtree moves up one level with it.
-    for (const k of await this.store.childrenOf(this.boardId, t.id)) {
-      k.level = (levelOf(k) - 1 || 1) as Level;
-      await this.saveTask(k);
+    let par: Task | null;
+    try {
+      par = await promoteTask(this.store, this.boardId, t);
+    } catch (error) {
+      if (error instanceof BoardEditError) return reply(error.message);
+      throw error;
     }
     await this.rebuildContext();
     return reply(
-      `Promoted "${t.title}" to Level ${t.level} (${LEVEL_NAME[t.level]})${t.parentId ? ` under ${t.parentId}` : ""}. It keeps its plan, handoffs and chats; ${par ? `"${par.title}" stays reachable as a former parent. ` : ""}You can now create subtasks under it with board_create_task (fromStep turns a plan step into one).`,
+      `Promoted "${t.title}" to Level ${levelOf(t)} (${LEVEL_NAME[levelOf(t)]})${t.parentId ? ` under ${t.parentId}` : ""}. It keeps its plan, handoffs and chats; ${par ? `"${par.title}" stays reachable as a former parent. ` : ""}You can now create subtasks under it with board_create_task (fromStep turns a plan step into one).`,
     );
   }
 
@@ -1313,25 +1308,12 @@ When linked, the tool returns the task's plan and handoff: continue from them.`;
   async moveTask(a: Record<string, unknown>): Promise<BoardReply> {
     const t = await this.requireTask(a);
     if (typeof t === "string") return reply(t);
-    const all = await this.listTasks();
-    const par = a.parentId ? all.find((x) => x.id === slug(str(a.parentId))) : null;
-    if (a.parentId && !par) return reply(`No task "${str(a.parentId)}".`);
-    const kids = (id: string) => all.filter((x) => x.parentId === id);
-    const desc = (id: string): Task[] => kids(id).flatMap((k) => [k, ...desc(k.id)]);
-    if (par && (par.id === t.id || desc(t.id).some((d) => d.id === par.id)))
-      return reply("Cannot move a task under itself.");
-    const height = (id: string): number => 1 + Math.max(0, ...kids(id).map((k) => height(k.id)));
-    const newLevel = par ? levelOf(par) + 1 : 1;
-    if (newLevel + height(t.id) - 1 > 3) return reply("That would go deeper than 3 levels.");
-    const delta = newLevel - levelOf(t);
-    const old = t.parentId ? all.find((x) => x.id === t.parentId) : null;
-    if (old && old.id !== par?.id)
-      t.origin = [...(t.origin ?? []), { id: old.id, title: old.title }];
-    t.parentId = par?.id ?? null;
-    for (const x of [t, ...desc(t.id)]) {
-      x.level = Math.min(3, Math.max(1, levelOf(x) + delta)) as Level;
-      if (x.level === 1 && !x.kind) x.kind = "feature";
-      await this.saveTask(x);
+    let par: Task | null;
+    try {
+      par = await moveTask(this.store, this.boardId, t, a.parentId ? str(a.parentId) : null);
+    } catch (error) {
+      if (error instanceof BoardEditError) return reply(error.message);
+      throw error;
     }
     await this.rebuildContext();
     return reply(

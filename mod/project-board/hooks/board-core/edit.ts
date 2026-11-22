@@ -6,10 +6,21 @@
  *
  * @module board-core/edit
  */
+import type { BoardGit } from "./io.ts";
 import { markStepDelegated, setDelegatedDone, setStepDone, stepDone } from "./plan.ts";
 import { type BoardStore, levelOf } from "./store.ts";
-import { slug, stamp } from "./text.ts";
-import type { Decision, ItemKind, Level, LinkType, Task, TaskDoc, TaskStatus } from "./types.ts";
+import { isInside, norm, sameRoot, slug, stamp } from "./text.ts";
+import type {
+  Board,
+  Decision,
+  ItemKind,
+  Level,
+  LinkType,
+  RepoState,
+  Task,
+  TaskDoc,
+  TaskStatus,
+} from "./types.ts";
 
 /** Who made a change, recorded on what it adds: a chat's session id, or an app. */
 export interface EditActor {
@@ -71,7 +82,33 @@ export type TaskEdit =
       readonly decisionId: string;
       readonly action: "decide" | "drop" | "reopen";
       readonly verdict?: string | undefined;
-    };
+    }
+  | {
+      readonly op: "updateDecision";
+      readonly decisionId: string;
+      readonly title?: string | undefined;
+      readonly description?: string | undefined;
+      readonly options?: string | undefined;
+      readonly refs?: ReadonlyArray<string> | undefined;
+    }
+  | {
+      readonly op: "implemented";
+      readonly decisionId: string;
+      readonly problem: string;
+      readonly approach: string;
+      readonly api: string;
+      readonly code: string;
+      readonly tests: string;
+    }
+  /** Re-parents the task (null: a master task); its subtasks move with it. */
+  | { readonly op: "move"; readonly parentId: string | null }
+  /** One level up: task → module → master task; its subtasks move with it. */
+  | { readonly op: "promote" }
+  /** Gives the task's module (or master task) to a workspace copy, or releases it (null). */
+  | { readonly op: "setOwner"; readonly root: string | null }
+  /** Hands the module over once everything is pushed, clean and checkpointed. */
+  | { readonly op: "softRelease" }
+  | { readonly op: "reclaim" };
 
 export interface EditResult {
   readonly message: string;
@@ -318,13 +355,157 @@ export async function setTaskLink(
   return { from, to, type };
 }
 
-/** Applies one change a person made to a task in an app. */
+const LEVEL_NAME: Record<Level, string> = { 1: "master task", 2: "module", 3: "task" };
+
+/** Re-parents `task` with its subtree; levels follow, at most three deep. */
+export async function moveTask(
+  store: BoardStore,
+  boardId: string,
+  task: Task,
+  parentId: string | null,
+): Promise<Task | null> {
+  const all = await store.listTasks(boardId);
+  const parent = parentId ? (all.find((x) => x.id === slug(parentId)) ?? null) : null;
+  if (parentId && !parent) throw new BoardEditError(`No task "${parentId}".`);
+  const kids = (id: string) => all.filter((x) => x.parentId === id);
+  const below = (id: string): Task[] => kids(id).flatMap((k) => [k, ...below(k.id)]);
+  if (parent && (parent.id === task.id || below(task.id).some((d) => d.id === parent.id)))
+    throw new BoardEditError("Cannot move a task under itself.");
+  const height = (id: string): number => 1 + Math.max(0, ...kids(id).map((k) => height(k.id)));
+  const level = parent ? levelOf(parent) + 1 : 1;
+  if (level + height(task.id) - 1 > 3)
+    throw new BoardEditError("That would go deeper than 3 levels.");
+  const delta = level - levelOf(task);
+  const old = task.parentId ? all.find((x) => x.id === task.parentId) : undefined;
+  if (old && old.id !== parent?.id)
+    task.origin = [...(task.origin ?? []), { id: old.id, title: old.title }];
+  task.parentId = parent?.id ?? null;
+  for (const x of [task, ...below(task.id)]) {
+    x.level = Math.min(3, Math.max(1, levelOf(x) + delta)) as Level;
+    if (x.level === 1 && !x.kind) x.kind = "feature";
+    await store.saveTask(boardId, x);
+  }
+  return parent;
+}
+
+/** Moves `task` one level up; its former parent stays reachable as an origin. */
+export async function promoteTask(
+  store: BoardStore,
+  boardId: string,
+  task: Task,
+): Promise<Task | null> {
+  const level = levelOf(task);
+  if (level === 1) throw new BoardEditError(`"${task.title}" is already a master task.`);
+  const parent = task.parentId ? await store.loadTask(boardId, task.parentId) : null;
+  task.origin = [
+    ...(task.origin ?? []),
+    ...(parent ? [{ id: parent.id, title: parent.title }] : []),
+  ];
+  task.parentId = parent?.parentId ?? null;
+  task.level = (level - 1) as Level;
+  for (const d of task.decisions ?? []) if (d.level === level) d.level = task.level;
+  if (task.level === 1 && !task.kind) task.kind = "feature";
+  await store.saveTask(boardId, task);
+  for (const kid of await store.childrenOf(boardId, task.id)) {
+    kid.level = (levelOf(kid) - 1 || 1) as Level;
+    await store.saveTask(boardId, kid);
+  }
+  return parent;
+}
+
+/** Ownership lives on modules and master tasks; a task belongs to its module's owner. */
+async function ownerNodeOf(store: BoardStore, boardId: string, task: Task): Promise<Task> {
+  if (levelOf(task) === 3 && task.parentId)
+    return (await store.loadTask(boardId, task.parentId)) ?? task;
+  return task;
+}
+
+function ownerHistory(
+  store: BoardStore,
+  task: Task,
+  type: string,
+  actor: EditActor,
+  extra: { from?: string | undefined; to?: string | undefined },
+): void {
+  task.ownerHistory = [
+    ...(task.ownerHistory ?? []),
+    { type, at: store.clock.now(), by: actor.by, ...extra },
+  ].slice(-30);
+}
+
+/** The repos a module works in, in workspace copy `root`: its tree's service folders there. */
+async function reposAt(
+  store: BoardStore,
+  boardId: string,
+  board: Board,
+  node: Task,
+  root: string,
+  git: BoardGit,
+): Promise<RepoState[]> {
+  const all = await store.listTasks(boardId);
+  const below = (id: string): Task[] =>
+    all.filter((x) => x.parentId === id).flatMap((k) => [k, ...below(k.id)]);
+  const ids = new Set(
+    [node, ...below(node.id)].flatMap((x) => [
+      ...(x.services ?? []),
+      ...(x.mainService ? [x.mainService] : []),
+    ]),
+  );
+  const seen = new Map<string, RepoState>();
+  for (const svc of board.services ?? [])
+    if (ids.has(svc.id))
+      for (const m of svc.match) {
+        const dir = `${norm(root)}/${m}`;
+        if (!(await store.io.exists(dir).catch(() => false))) continue;
+        const state = await git.state(dir);
+        if (state && !seen.has(state.repo)) seen.set(state.repo, { ...state, service: svc.id });
+      }
+  if (seen.size === 0) {
+    const state = await git.state(norm(root)).catch(() => null);
+    if (state) seen.set(state.repo, state);
+  }
+  return [...seen.values()];
+}
+
+/** Why a module isn't ready to hand over: unpushed or uncommitted work, or a stale handoff. */
+async function softReleaseProblems(
+  store: BoardStore,
+  boardId: string,
+  node: Task,
+  repos: ReadonlyArray<RepoState>,
+): Promise<string[]> {
+  const problems: string[] = [];
+  if (!repos.length) problems.push("no repos found: tag the services it touches first");
+  for (const r of repos) {
+    if (!r.upstream) problems.push(`${r.name}: branch ${r.branch} has no upstream, push it`);
+    else if (r.ahead) problems.push(`${r.name}: ${r.ahead} commit(s) on ${r.branch} not pushed`);
+    if (r.dirty) problems.push(`${r.name}: ${r.dirty} uncommitted change(s)`);
+  }
+  const all = await store.listTasks(boardId);
+  const below = (id: string): Task[] =>
+    all.filter((x) => x.parentId === id).flatMap((k) => [k, ...below(k.id)]);
+  let handoffAt = 0;
+  for (const x of [node, ...below(node.id)]) {
+    const at = await store.io
+      .stat(store.livingPath(boardId, x.id))
+      .then((s) => s.mtimeMs)
+      .catch(() => 0);
+    handoffAt = Math.max(handoffAt, at);
+  }
+  const lastCommit = Math.max(0, ...repos.map((r) => r.lastCommitAt));
+  if (repos.length && handoffAt < lastCommit)
+    problems.push("the living handoff is older than the last commit: checkpoint first");
+  return problems;
+}
+
+/** Applies one change a person made to a task in an app. `git` reads repo state for a soft release. */
 export async function editTask(
   store: BoardStore,
   boardId: string,
   taskId: string,
   edit: TaskEdit,
   actor: EditActor,
+  git?: BoardGit,
 ): Promise<EditResult> {
   const task = await requireTask(store, boardId, taskId);
   const now = store.clock.now();
@@ -472,5 +653,201 @@ export async function editTask(
       await store.saveTask(boardId, found.owner);
       return { message: `Decision is now ${found.decision.status}.` };
     }
+    case "updateDecision": {
+      const found = await findDecision(store, boardId, task, edit.decisionId);
+      if (!found) throw new BoardEditError(`No decision "${edit.decisionId}".`);
+      const d = found.decision;
+      if (edit.title !== undefined) {
+        if (!edit.title.trim()) throw new BoardEditError("The question can't be empty.");
+        d.title = edit.title.trim();
+      }
+      if (edit.description !== undefined) d.description = edit.description;
+      if (edit.options !== undefined) d.options = edit.options;
+      if (edit.refs !== undefined) d.refs = [...edit.refs];
+      await store.saveTask(boardId, found.owner);
+      return { message: "Decision saved." };
+    }
+    case "implemented": {
+      const found = await findDecision(store, boardId, task, edit.decisionId);
+      if (!found) throw new BoardEditError(`No decision "${edit.decisionId}".`);
+      if (!found.decision.rec)
+        throw new BoardEditError("Only recommendations have a How implemented record.");
+      found.decision.rec.implemented = {
+        problem: edit.problem,
+        approach: edit.approach,
+        api: edit.api,
+        code: edit.code,
+        tests: edit.tests,
+        at: now,
+      };
+      await store.saveTask(boardId, found.owner);
+      return { message: "How implemented saved." };
+    }
+    case "move": {
+      const parent = await moveTask(store, boardId, task, edit.parentId);
+      return {
+        message: parent
+          ? `Moved under "${parent.title}" (now a ${LEVEL_NAME[levelOf(task)]}).`
+          : "Moved to the top level (master task).",
+      };
+    }
+    case "promote": {
+      await promoteTask(store, boardId, task);
+      return { message: `Promoted to ${LEVEL_NAME[levelOf(task)]}.` };
+    }
+    case "setOwner": {
+      const node = await ownerNodeOf(store, boardId, task);
+      if (edit.root === null) {
+        if (node.owner) ownerHistory(store, node, "release", actor, { from: node.owner.label });
+        node.owner = null;
+        await store.saveTask(boardId, node);
+        return { message: `Released "${node.title}": the next workspace to link claims it.` };
+      }
+      const board = (await store.loadRegistry()).boards.find((b) => b.id === boardId);
+      const root = board?.roots.find((r) => sameRoot(r.path, edit.root ?? ""));
+      if (!root) throw new BoardEditError("That folder is not a workspace of this board.");
+      ownerHistory(store, node, node.owner ? "takeover" : "assigned", actor, {
+        from: node.owner?.label,
+        to: root.label,
+      });
+      node.owner = { root: norm(root.path), label: root.label, state: "owned", since: now };
+      await store.saveTask(boardId, node);
+      return { message: `"${node.title}" is owned by ${root.label}.` };
+    }
+    case "softRelease": {
+      const node = await ownerNodeOf(store, boardId, task);
+      if (!node.owner) throw new BoardEditError("Nobody owns this module or master task.");
+      if (!git) throw new BoardEditError("Repo state can't be read here.");
+      const board = (await store.loadRegistry()).boards.find((b) => b.id === boardId);
+      if (!board) throw new BoardEditError("No such board.");
+      const repos = await reposAt(store, boardId, board, node, node.owner.root, git);
+      const problems = await softReleaseProblems(store, boardId, node, repos);
+      if (problems.length)
+        throw new BoardEditError(`Not ready for a soft release: ${problems.join("; ")}.`);
+      node.owner = { ...node.owner, state: "soft", softAt: now, pickup: repos };
+      ownerHistory(store, node, "soft-release", actor, { from: node.owner.label });
+      await store.saveTask(boardId, node);
+      return { message: `Soft-released "${node.title}": another workspace can take over.` };
+    }
+    case "reclaim": {
+      const node = await ownerNodeOf(store, boardId, task);
+      if (!node.owner) throw new BoardEditError("Nobody owns this module or master task.");
+      const { softAt: _softAt, pickup: _pickup, ...owned } = node.owner;
+      node.owner = { ...owned, state: "owned" };
+      ownerHistory(store, node, "reclaim", actor, { to: node.owner.label });
+      await store.saveTask(boardId, node);
+      return { message: `"${node.title}" is owned by ${node.owner.label} again.` };
+    }
   }
+}
+
+/** A change to a board's own settings, made with ⚙ in an app. */
+export type BoardSettingsEdit =
+  | { readonly op: "rename"; readonly name: string }
+  | { readonly op: "addRoot"; readonly path: string; readonly label: string }
+  | { readonly op: "removeRoot"; readonly path: string }
+  | { readonly op: "labelRoot"; readonly path: string; readonly label: string }
+  | {
+      readonly op: "saveServices";
+      readonly services: ReadonlyArray<{
+        readonly id?: string | undefined;
+        readonly name: string;
+        readonly match: ReadonlyArray<string>;
+      }>;
+    }
+  | { readonly op: "saveRules"; readonly rules: string }
+  | { readonly op: "setBoardMode"; readonly on: boolean }
+  | {
+      readonly op: "saveRegisters";
+      readonly registers: ReadonlyArray<{
+        readonly id?: string | undefined;
+        readonly topic: string;
+        readonly url: string;
+      }>;
+    };
+
+const baseName = (p: string) => norm(p).split("/").pop() ?? p;
+
+/** Applies one change to the board's settings in `boards.json`. */
+export async function editBoard(
+  store: BoardStore,
+  boardId: string,
+  edit: BoardSettingsEdit,
+): Promise<EditResult> {
+  const reg = await store.loadRegistry();
+  const board = reg.boards.find((b) => b.id === boardId);
+  if (!board) throw new BoardEditError("No such board.");
+  switch (edit.op) {
+    case "rename": {
+      const name = edit.name.trim();
+      if (!name) throw new BoardEditError("The board needs a name.");
+      if (reg.boards.some((b) => b.id !== boardId && b.name.toLowerCase() === name.toLowerCase()))
+        throw new BoardEditError(`A board named ${name} already exists.`);
+      board.name = name;
+      break;
+    }
+    case "addRoot": {
+      const path = norm(edit.path.trim());
+      if (!path) throw new BoardEditError("A folder is required.");
+      if (!(await store.io.exists(path).catch(() => false)))
+        throw new BoardEditError(`No folder at ${path}.`);
+      const taken = reg.boards.find((b) =>
+        b.roots.some(
+          (r) => sameRoot(r.path, path) || isInside(path, r.path) || isInside(r.path, path),
+        ),
+      );
+      if (taken)
+        throw new BoardEditError(
+          taken.id === boardId
+            ? "That folder is already a workspace of this board, or inside one."
+            : `That folder overlaps a workspace of the ${taken.name} board.`,
+        );
+      board.roots.push({ path, label: edit.label.trim() || baseName(path) });
+      break;
+    }
+    case "removeRoot": {
+      if (board.roots.length <= 1)
+        throw new BoardEditError("A board keeps at least one workspace.");
+      const before = board.roots.length;
+      board.roots = board.roots.filter((r) => !sameRoot(r.path, edit.path));
+      if (board.roots.length === before) throw new BoardEditError("No such workspace.");
+      break;
+    }
+    case "labelRoot": {
+      const root = board.roots.find((r) => sameRoot(r.path, edit.path));
+      if (!root) throw new BoardEditError("No such workspace.");
+      if (!edit.label.trim()) throw new BoardEditError("The workspace needs a label.");
+      root.label = edit.label.trim();
+      break;
+    }
+    case "saveServices":
+      board.services = edit.services
+        .map((x) => ({
+          id: slug(x.id || x.name),
+          name: x.name.trim(),
+          match: x.match
+            .map((m) =>
+              m
+                .trim()
+                .replace(/\\/g, "/")
+                .replace(/^\/+|\/+$/g, ""),
+            )
+            .filter(Boolean),
+        }))
+        .filter((x) => x.name);
+      break;
+    case "saveRules":
+      board.rules = edit.rules;
+      break;
+    case "setBoardMode":
+      board.boardMode = edit.on;
+      break;
+    case "saveRegisters":
+      board.registers = edit.registers
+        .map((x) => ({ id: slug(x.id || x.topic), topic: x.topic.trim(), url: x.url.trim() }))
+        .filter((x) => x.topic);
+      break;
+  }
+  await store.saveRegistry(reg);
+  return { message: "Saved." };
 }

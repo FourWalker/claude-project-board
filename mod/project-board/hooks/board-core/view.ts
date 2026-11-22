@@ -251,6 +251,14 @@ export interface BoardTaskDetail {
       readonly group: "own" | "up" | "inherited";
       readonly r: string | null;
       readonly area: string;
+      /** A decided recommendation's record of how it was built. */
+      readonly implemented: {
+        readonly problem: string;
+        readonly approach: string;
+        readonly api: string;
+        readonly code: string;
+        readonly tests: string;
+      } | null;
       readonly decidedAt: number | null;
       readonly raisedFrom: { readonly id: string; readonly title: string } | null;
       readonly filedOn: { readonly id: string; readonly title: string };
@@ -323,6 +331,15 @@ export async function readTaskDetail(
       group,
       r: d.rec?.r ?? null,
       area: d.rec?.area ?? "",
+      implemented: d.rec?.implemented
+        ? {
+            problem: d.rec.implemented.problem ?? "",
+            approach: d.rec.implemented.approach ?? "",
+            api: d.rec.implemented.api ?? "",
+            code: d.rec.implemented.code ?? "",
+            tests: d.rec.implemented.tests ?? "",
+          }
+        : null,
       decidedAt: d.decidedAt ?? null,
       raisedFrom: d.raisedFrom ?? null,
       filedOn: { id: owner.id, title: owner.title },
