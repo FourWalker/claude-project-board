@@ -71,15 +71,28 @@ export function planProgress(plan: string): { readonly done: number; readonly to
 }
 
 export function tickStep(plan: string, id: string): string {
+  return setStepDone(plan, id, true);
+}
+
+/** Ticks or unticks step `id`. */
+export function setStepDone(plan: string, id: string, done: boolean): string {
   return plan
     .split(/\r?\n/)
     .map((line) => {
       const m = STEP.exec(line);
-      return m && (m[4] ?? "").toLowerCase() === id.toLowerCase()
-        ? line.replace(/\[ \]/, "[x]")
-        : line;
+      if (!m || (m[4] ?? "").toLowerCase() !== id.toLowerCase()) return line;
+      return done ? line.replace(/\[ \]/, "[x]") : line.replace(/\[[xX]\]/, "[ ]");
     })
     .join("\n");
+}
+
+/** Whether step `id` is ticked; null when the plan has no such step. */
+export function stepDone(plan: string, id: string): boolean | null {
+  for (const line of plan.split(/\r?\n/)) {
+    const m = STEP.exec(line);
+    if (m && (m[4] ?? "").toLowerCase() === id.toLowerCase()) return m[2] !== " ";
+  }
+  return null;
 }
 
 /** Marks a parent plan step as taken over by a subtask: `- [ ] A2 name → (task <id>)`. */

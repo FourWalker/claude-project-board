@@ -6,15 +6,18 @@
  *
  * @module board-core/chat
  */
-import type { BoardGit } from "./io.ts";
 import {
-  markStepDelegated,
-  nextStep,
-  objectiveLine,
-  planProgress,
-  setDelegatedDone,
-  tickStep,
-} from "./plan.ts";
+  BoardEditError,
+  type EditActor,
+  addDecision,
+  createTask,
+  findDecision,
+  setTaskLink,
+  settleDecision,
+  syncDelegatedSteps,
+} from "./edit.ts";
+import type { BoardGit } from "./io.ts";
+import { nextStep, objectiveLine, planProgress, tickStep } from "./plan.ts";
 import { type BoardHost, boardModeProtocol, resumeHint, toolRules } from "./protocol.ts";
 import { BoardStore, LEVEL_NAME, findBoard, levelOf } from "./store.ts";
 import {
@@ -77,11 +80,6 @@ const str = (v: unknown, fallback = ""): string =>
 
 export const repoLine = (r: RepoState): string =>
   `${r.name} · ${r.branch} @ ${r.head} · ${!r.upstream ? "not pushed (no upstream)" : r.ahead ? `${r.ahead} commit(s) not pushed` : "pushed"}${r.behind ? `, ${r.behind} behind` : ""} · ${r.dirty ? `${r.dirty} uncommitted` : "clean"}`;
-
-const LINK_FLIP: Record<string, readonly [LinkType, boolean]> = {
-  blocks: ["blocked_by", true],
-  led_to: ["found_during", true],
-};
 
 export class BoardChat {
   readonly store: BoardStore;
@@ -940,6 +938,10 @@ When linked, the tool returns the task's plan and handoff: continue from them.`;
     };
   }
 
+  private actor(): EditActor {
+    return { by: this.sess?.sessionId ?? this.host };
+  }
+
   private newId(prefix: string, upper = false, suffixMax = 0): string {
     const t = this.now().toString(36);
     return `${prefix}${upper ? t.toUpperCase() : t}${suffixMax ? this.store.clock.random(suffixMax) : ""}`;
@@ -957,7 +959,10 @@ When linked, the tool returns the task's plan and handoff: continue from them.`;
     if (a.title) t.title = str(a.title);
     const wasDone = t.status === "done";
     if (a.status === "active" || a.status === "paused" || a.status === "done") t.status = a.status;
-    const delegated = wasDone !== (t.status === "done") ? await this.syncDelegatedSteps(t) : [];
+    const delegated =
+      wasDone !== (t.status === "done")
+        ? await syncDelegatedSteps(this.store, this.boardId, t)
+        : [];
     if (Array.isArray(a.services)) t.services = [...new Set(a.services.map(String))];
     if (a.mainService !== undefined) t.mainService = a.mainService ? str(a.mainService) : null;
     if (a.kind === "feature" || a.kind === "backlog") t.kind = a.kind;
@@ -1003,25 +1008,6 @@ When linked, the tool returns the task's plan and handoff: continue from them.`;
     return reply(
       `Board updated for "${t.title}". Open items: ${t.items.filter((i) => !i.done).length}.${delegated.length ? ` ${t.status === "done" ? "Ticked" : "Reopened"} the parent step it took over (${delegated.join(", ")}).` : ""}`,
     );
-  }
-
-  /**
-   * A subtask that took over a parent plan step finishes that step when it's done, and reopens
-   * it when it's reopened, so the parent's next step never points at finished work.
-   */
-  private async syncDelegatedSteps(t: Task): Promise<string[]> {
-    if (!t.parentId) return [];
-    const path = this.store.planPath(this.boardId, t.parentId);
-    const plan = await this.store.readText(path);
-    const updated = setDelegatedDone(plan, t.id, t.status === "done");
-    if (updated === plan) return [];
-    await this.store.io.write(path, updated);
-    const before = plan.split(/\r?\n/);
-    return updated
-      .split(/\r?\n/)
-      .filter((line, i) => line !== before[i])
-      .map((line) => nextStep(line.replace(/\[[xX]\]/, "[ ]"))?.id ?? "")
-      .filter(Boolean);
   }
 
   async savePlan(a: Record<string, unknown>): Promise<BoardReply> {
@@ -1081,65 +1067,39 @@ When linked, the tool returns the task's plan and handoff: continue from them.`;
 
   async createTask(a: Record<string, unknown>): Promise<BoardReply> {
     if (!this.board) return reply(await this.unassignedHelp());
-    const title = str(a.title).trim();
-    if (!title) return reply("title is required.");
-    let par: Task | null = null;
-    if (a.parentId) {
-      par = await this.loadTask(slug(str(a.parentId)));
-      if (!par) return reply(`No task "${str(a.parentId)}".`);
-      if (levelOf(par) >= 3)
-        return reply(
-          `"${par.title}" is a Level 3 task and can't have subtasks. Promote it first (board_promote), then create subtasks under it.`,
-        );
+    let t: Task;
+    try {
+      t = await createTask(
+        this.store,
+        this.boardId,
+        {
+          title: str(a.title),
+          parentId: a.parentId ? str(a.parentId) : null,
+          description: str(a.description),
+          kind: a.kind === "backlog" ? "backlog" : undefined,
+          services: Array.isArray(a.services) ? a.services.map(String) : undefined,
+          mainService: a.mainService ? str(a.mainService) : undefined,
+          bug: !!a.bug,
+          fixes: a.fixes ? str(a.fixes) : undefined,
+          plan: a.plan ? str(a.plan) : undefined,
+          fromStep: a.fromStep ? str(a.fromStep) : undefined,
+        },
+        this.actor(),
+      );
+    } catch (error) {
+      if (error instanceof BoardEditError) return reply(error.message);
+      throw error;
     }
-    const id = await this.store.freeTaskId(this.boardId, slug(title));
-    const level = (par ? levelOf(par) + 1 : 1) as Level;
-    const t: Task = {
-      id,
-      title,
-      description: str(a.description),
-      status: "active",
-      createdAt: this.now(),
-      updatedAt: this.now(),
-      lastAction: null,
-      items: [],
-      sessions: [],
-      level,
-      parentId: par?.id ?? null,
-    };
-    if (level === 1) t.kind = a.kind === "backlog" ? "backlog" : "feature";
-    if (Array.isArray(a.services)) t.services = a.services.map(String);
-    if (a.mainService) t.mainService = str(a.mainService);
-    if (a.bug) t.bug = true;
-    if (a.fixes) {
-      const orig = await this.loadTask(slug(str(a.fixes)));
-      if (orig)
-        t.links = [
-          {
-            to: orig.id,
-            type: "fixes",
-            note: str(a.description),
-            at: this.now(),
-            by: this.sess?.sessionId,
-          },
-        ];
-    }
-    await this.saveTask(t);
-    if (a.plan) await this.store.io.write(this.store.planPath(this.boardId, id), str(a.plan));
-    if (par && a.fromStep) {
-      const pp = this.store.planPath(this.boardId, par.id);
-      const plan = await this.store.readText(pp);
-      const marked = markStepDelegated(plan, str(a.fromStep), id);
-      if (marked !== plan) await this.store.io.write(pp, marked);
-    }
+    const level = levelOf(t);
+    const par = t.parentId ? await this.loadTask(t.parentId) : null;
     this.reported = true;
     await this.rebuildContext();
     const pickUp =
       this.host === "t3"
-        ? `Start it with Continue in new thread on task ${id}.`
-        : `A chat picks it up with /task ${id}.`;
+        ? `Start it with Continue in new thread on task ${t.id}.`
+        : `A chat picks it up with /task ${t.id}.`;
     return reply(
-      `Created Level ${level} ${LEVEL_NAME[level]} "${title}" (id ${id})${par ? ` under "${par.title}"` : ""}. ${pickUp}`,
+      `Created Level ${level} ${LEVEL_NAME[level]} "${t.title}" (id ${t.id})${par ? ` under "${par.title}"` : ""}. ${pickUp}`,
     );
   }
 
@@ -1199,44 +1159,35 @@ When linked, the tool returns the task's plan and handoff: continue from them.`;
   async fileDecision(a: Record<string, unknown>): Promise<BoardReply> {
     const cur = await this.requireTask(a);
     if (typeof cur === "string") return reply(cur);
-    const anc = await this.store.ancestorsOf(this.boardId, cur);
-    const chain = [cur, ...anc];
     if (a.action === "add" || !a.action) {
-      const title = str(a.title).trim();
-      if (!title) return reply("title is required.");
-      const want = Number(a.level ?? levelOf(cur));
-      const owner = chain.find((x) => levelOf(x) <= want) ?? chain[chain.length - 1] ?? cur;
-      const d: Decision = {
-        id: this.newId("D-", true),
-        title,
-        description: str(a.description),
-        level: levelOf(owner),
-        raisedFrom: owner.id === cur.id ? null : { id: cur.id, title: cur.title },
-        refs: Array.isArray(a.refs) ? a.refs.map(String) : [],
-        options: str(a.options),
-        verdict: "",
-        status: "open",
-        at: this.now(),
-        by: this.sess?.sessionId,
-      };
-      if (a.recommendation) {
-        const max = Math.max(
-          0,
-          ...(await this.listTasks()).flatMap((x) =>
-            (x.decisions ?? []).map((y) => Number(str(y.rec?.r).replace(/\D/g, "")) || 0),
-          ),
+      let filed: { readonly decision: Decision; readonly owner: Task };
+      try {
+        filed = await addDecision(
+          this.store,
+          this.boardId,
+          cur,
+          {
+            title: str(a.title),
+            description: str(a.description),
+            options: str(a.options),
+            refs: Array.isArray(a.refs) ? a.refs.map(String) : [],
+            level: Number(a.level ?? levelOf(cur)),
+            recommendation: a.recommendation
+              ? {
+                  r: a.r ? str(a.r) : undefined,
+                  area: str(a.area),
+                  lldCheck: str(a.lldCheck),
+                  register: a.register ? str(a.register) : null,
+                }
+              : undefined,
+          },
+          this.actor(),
         );
-        d.rec = {
-          r: a.r ? str(a.r) : `R${max + 1}`,
-          area: str(a.area),
-          lldCheck: str(a.lldCheck),
-          register: a.register ? str(a.register) : null,
-          implemented: null,
-        };
+      } catch (error) {
+        if (error instanceof BoardEditError) return reply(error.message);
+        throw error;
       }
-      // `owner` may be `cur` or an ancestor: either way it is the object we save.
-      owner.decisions = [...(owner.decisions ?? []), d];
-      await this.saveTask(owner);
+      const { decision: d, owner } = filed;
       await this.rebuildContext();
       if (d.rec)
         return reply(
@@ -1248,10 +1199,9 @@ When linked, the tool returns the task's plan and handoff: continue from them.`;
     }
     // decide / update / drop: find it on this task, its parents, or (by id) anywhere on the board
     const id = str(a.id);
-    const has = (x: Task) => (x.decisions ?? []).some((d) => d.id === id || d.rec?.r === id);
-    const owner = chain.find(has) ?? (await this.listTasks()).find(has);
-    const d = owner?.decisions?.find((x) => x.id === id || x.rec?.r === id);
-    if (!owner || !d) return reply(`No decision "${id}".`);
+    const found = await findDecision(this.store, this.boardId, cur, id);
+    if (!found) return reply(`No decision "${id}".`);
+    const { decision: d, owner } = found;
     if (a.title) d.title = str(a.title);
     if (a.description) d.description = str(a.description);
     if (a.options) d.options = str(a.options);
@@ -1268,16 +1218,8 @@ When linked, the tool returns the task's plan and handoff: continue from them.`;
         at: this.now(),
       };
     }
-    if (a.action === "decide") {
-      d.status = "decided";
-      d.verdict = str(a.verdict);
-      d.decidedAt = this.now();
-    }
-    if (a.action === "drop") {
-      d.status = "dropped";
-      d.verdict = str(a.verdict);
-    }
-    if (a.action === "reopen") d.status = "open";
+    if (a.action === "decide" || a.action === "drop" || a.action === "reopen")
+      settleDecision(this.store, d, a.action, str(a.verdict));
     await this.saveTask(owner);
     await this.rebuildContext();
     return reply(`Decision ${d.id} on "${owner.title}" is now ${d.status}.`);
@@ -1337,35 +1279,34 @@ When linked, the tool returns the task's plan and handoff: continue from them.`;
   async linkTasks(a: Record<string, unknown>): Promise<BoardReply> {
     const cur = await this.requireTask(a);
     if (typeof cur === "string") return reply(cur);
-    const other = await this.loadTask(slug(str(a.to)));
-    if (!other) return reply(`No task "${str(a.to)}". Use board_find to look it up.`);
-    let type = str(a.type, "related");
-    let from = cur;
-    let to = other;
-    const flip = LINK_FLIP[type];
-    if (flip) {
-      type = flip[0];
-      from = other;
-      to = cur;
+    let linked: { readonly from: Task; readonly to: Task; readonly type: LinkType };
+    try {
+      linked = await setTaskLink(
+        this.store,
+        this.boardId,
+        cur,
+        {
+          to: str(a.to),
+          type: str(a.type, "related"),
+          note: str(a.note),
+          remove: a.action === "remove",
+        },
+        this.actor(),
+      );
+    } catch (error) {
+      if (error instanceof BoardEditError)
+        return reply(
+          error.message.startsWith("No task")
+            ? `${error.message} Use board_find to look it up.`
+            : error.message,
+        );
+      throw error;
     }
-    if (type !== "blocked_by" && type !== "found_during" && type !== "related" && type !== "fixes")
-      return reply("type must be blocked_by, blocks, found_during, led_to, related or fixes.");
-    if (from.id === to.id) return reply("A task cannot link to itself.");
-    from.links = (from.links ?? []).filter((l) => !(l.to === to.id && l.type === type));
-    if (a.action !== "remove")
-      from.links.push({
-        to: to.id,
-        type,
-        note: str(a.note),
-        at: this.now(),
-        by: this.sess?.sessionId,
-      });
-    await this.saveTask(from);
     await this.rebuildContext();
     return reply(
       a.action === "remove"
         ? "Removed the link."
-        : `Linked: "${from.title}" ${type.replace("_", " ")} "${to.title}".`,
+        : `Linked: "${linked.from.title}" ${linked.type.replace("_", " ")} "${linked.to.title}".`,
     );
   }
 

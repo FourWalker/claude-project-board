@@ -223,6 +223,8 @@ export interface BoardTaskDetail {
   readonly masterPlan: string;
   readonly masterTaskId: string;
   readonly plan: ReadonlyArray<PlanPhase>;
+  /** plan.md as written, for editing. */
+  readonly planMarkdown: string;
   /** The living handoff, without its header comment. */
   readonly handoff: string;
   /** Step notes, newest first. */
@@ -329,6 +331,7 @@ export async function readTaskDetail(
     masterPlan,
     masterTaskId: master.id,
     plan: planPhases(plan),
+    planMarkdown: plan,
     handoff: stripHeader(handoff),
     stepNotes: stepNotes.map((n) => ({ ...n, text: stripHeader(n.text) })),
     docs: [
