@@ -23,6 +23,40 @@ export function nextStep(plan: string): PlanStep | null {
   return null;
 }
 
+export interface PlanPhase {
+  readonly title: string;
+  readonly steps: ReadonlyArray<{
+    readonly id: string;
+    readonly text: string;
+    readonly done: boolean;
+    /** The subtask that took the step over (`→ (task <id>)`). */
+    readonly childId: string | null;
+  }>;
+}
+
+/** The plan's phases (`##`/`###` headings) and their steps; steps before any heading go in "Plan". */
+export function planPhases(plan: string): ReadonlyArray<PlanPhase> {
+  const phases: Array<{ title: string; steps: Array<PlanPhase["steps"][number]> }> = [];
+  for (const line of plan.split(/\r?\n/)) {
+    const heading = /^#{2,3}\s+(.*)$/.exec(line);
+    if (heading) {
+      phases.push({ title: (heading[1] ?? "").trim(), steps: [] });
+      continue;
+    }
+    const m = STEP.exec(line);
+    if (!m) continue;
+    if (phases.length === 0) phases.push({ title: "Plan", steps: [] });
+    const text = m[5] ?? "";
+    phases.at(-1)?.steps.push({
+      id: m[4] ?? "",
+      text: text.replace(/\s*→\s*\(task [A-Za-z0-9-]+\)/, ""),
+      done: m[2] !== " ",
+      childId: /→\s*\(task ([A-Za-z0-9-]+)\)/.exec(text)?.[1] ?? null,
+    });
+  }
+  return phases.filter((phase) => phase.steps.length > 0);
+}
+
 /** How many of the plan's steps are ticked, out of all of them. */
 export function planProgress(plan: string): { readonly done: number; readonly total: number } {
   let done = 0;

@@ -124,6 +124,27 @@ export class BoardStore {
     for (let n = 2; await this.loadTask(boardId, id); n++) id = `${base}-${n}`;
     return id;
   }
+  /** A task's step notes, newest first. */
+  async stepNotes(
+    boardId: string,
+    id: string,
+  ): Promise<Array<{ step: string; at: number; text: string }>> {
+    try {
+      const dir = `${this.taskDir(boardId, id)}/handoffs`;
+      const files = (await this.io.list(dir))
+        .filter((f) => f.kind === "file" && f.name.endsWith(".md"))
+        .toSorted((a, b) => b.mtimeMs - a.mtimeMs);
+      return Promise.all(
+        files.map(async (f) => ({
+          step: f.name.replace(/\.md$/, ""),
+          at: f.mtimeMs,
+          text: await this.readText(`${dir}/${f.name}`),
+        })),
+      );
+    } catch {
+      return [];
+    }
+  }
   async latestHandoff(boardId: string, id: string): Promise<{ step: string; text: string } | null> {
     try {
       const files = (await this.io.list(`${this.taskDir(boardId, id)}/handoffs`))

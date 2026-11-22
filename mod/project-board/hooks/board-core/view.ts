@@ -4,7 +4,14 @@
  *
  * @module board-core/view
  */
-import { nextStep, planProgress, type PlanStep } from "./plan.ts";
+import {
+  nextStep,
+  objectiveLine,
+  type PlanPhase,
+  planPhases,
+  planProgress,
+  type PlanStep,
+} from "./plan.ts";
 import type { BoardStore } from "./store.ts";
 import { norm } from "./text.ts";
 import type {
@@ -12,6 +19,7 @@ import type {
   Item,
   Level,
   Owner,
+  RepoState,
   Session,
   Task,
   TaskDoc,
@@ -214,21 +222,60 @@ export interface BoardTaskDetail {
   /** The master implementation plan of the task's master task (its own, for a master task). */
   readonly masterPlan: string;
   readonly masterTaskId: string;
-  readonly plan: string;
+  readonly plan: ReadonlyArray<PlanPhase>;
   /** The living handoff, without its header comment. */
   readonly handoff: string;
-  readonly latestNote: { readonly step: string; readonly text: string } | null;
-  readonly docs: ReadonlyArray<Pick<TaskDoc, "id" | "kind" | "title" | "ref" | "note">>;
-  /** Decisions filed on this task, and on its parents when raised here. */
+  /** Step notes, newest first. */
+  readonly stepNotes: ReadonlyArray<{
+    readonly step: string;
+    readonly at: number;
+    readonly text: string;
+  }>;
+  /** This task's documents (`from` null), then its parents'. */
+  readonly docs: ReadonlyArray<
+    Pick<TaskDoc, "id" | "kind" | "title" | "ref" | "note"> & {
+      readonly from: { readonly id: string; readonly title: string; readonly level: Level } | null;
+    }
+  >;
+  /**
+   * `own`: filed on this task; `up`: raised here, filed on a parent; `inherited`: a parent's
+   * own decisions.
+   */
   readonly decisions: ReadonlyArray<
-    Pick<Decision, "id" | "title" | "description" | "options" | "verdict" | "status" | "level"> & {
+    Pick<
+      Decision,
+      "id" | "title" | "description" | "options" | "verdict" | "status" | "level" | "refs" | "at"
+    > & {
+      readonly group: "own" | "up" | "inherited";
       readonly r: string | null;
+      readonly area: string;
+      readonly decidedAt: number | null;
+      readonly raisedFrom: { readonly id: string; readonly title: string } | null;
       readonly filedOn: { readonly id: string; readonly title: string };
     }
   >;
+  readonly repoState: ReadonlyArray<
+    Pick<RepoState, "name" | "branch" | "head" | "upstream" | "ahead" | "behind" | "dirty" | "at">
+  >;
+  /** Root first: each parent's objective line, as chats on this task see it. */
+  readonly parents: ReadonlyArray<{
+    readonly id: string;
+    readonly title: string;
+    readonly level: Level;
+    readonly objective: string;
+  }>;
+  /** What each chat on this task (on a master task, in its tree) last asked and answered. */
+  readonly chats: ReadonlyArray<{
+    readonly sessionId: string;
+    readonly lastPrompt: string;
+    readonly lastAnswer: string;
+    readonly branch: string;
+    readonly subfolder: string;
+  }>;
 }
 
 const stripHeader = (md: string) => md.replace(/^<!--[\s\S]*?-->\s*/, "");
+const levelOf = (t: Task): Level => (t.level === 2 || t.level === 3 ? t.level : 1);
 
 export async function readTaskDetail(
   store: BoardStore,
@@ -238,41 +285,104 @@ export async function readTaskDetail(
   const task = await store.loadTask(boardId, taskId);
   if (!task) return null;
   const ancestors = await store.ancestorsOf(boardId, task);
-  const master = ancestors[0] ?? task;
-  const [masterPlan, plan, handoff, latestNote] = await Promise.all([
+  const rootFirst = ancestors.toReversed();
+  const master = rootFirst[0] ?? task;
+  const [masterPlan, plan, handoff, stepNotes, parentHandoffs, sessions, all] = await Promise.all([
     store.readText(store.masterPath(boardId, master.id)),
     store.readText(store.planPath(boardId, task.id)),
     store.readText(store.livingPath(boardId, task.id)),
-    store.latestHandoff(boardId, task.id),
+    store.stepNotes(boardId, task.id),
+    Promise.all(rootFirst.map((a) => store.readText(store.livingPath(boardId, a.id)))),
+    store.listSessions(boardId),
+    levelOf(task) === 1 ? store.listTasks(boardId) : Promise.resolve([] as Task[]),
   ]);
-  const decisions = [task, ...ancestors].flatMap((owner) =>
-    (owner.decisions ?? [])
-      .filter((d) => owner.id === task.id || d.raisedFrom?.id === task.id)
-      .map((d) => ({
-        id: d.id,
-        title: d.title,
-        description: d.description,
-        options: d.options,
-        verdict: d.verdict,
-        status: d.status,
-        level: d.level,
-        r: d.rec?.r ?? null,
-        filedOn: { id: owner.id, title: owner.title },
-      })),
-  );
+  // A master task's chats are every chat in its tree.
+  const tree = new Set([task.id]);
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const t of all)
+      if (t.parentId && tree.has(t.parentId) && !tree.has(t.id)) {
+        tree.add(t.id);
+        grew = true;
+      }
+  }
+  const decision =
+    (group: "own" | "up" | "inherited", owner: Task) =>
+    (d: Decision): BoardTaskDetail["decisions"][number] => ({
+      id: d.id,
+      title: d.title,
+      description: d.description,
+      options: d.options,
+      verdict: d.verdict,
+      status: d.status,
+      level: d.level,
+      refs: d.refs ?? [],
+      at: d.at,
+      group,
+      r: d.rec?.r ?? null,
+      area: d.rec?.area ?? "",
+      decidedAt: d.decidedAt ?? null,
+      raisedFrom: d.raisedFrom ?? null,
+      filedOn: { id: owner.id, title: owner.title },
+    });
   return {
     masterPlan,
     masterTaskId: master.id,
-    plan,
+    plan: planPhases(plan),
     handoff: stripHeader(handoff),
-    latestNote: latestNote ? { step: latestNote.step, text: stripHeader(latestNote.text) } : null,
-    docs: (task.docs ?? []).map((d) => ({
-      id: d.id,
-      kind: d.kind,
-      title: d.title,
-      ref: d.ref,
-      note: d.note,
+    stepNotes: stepNotes.map((n) => ({ ...n, text: stripHeader(n.text) })),
+    docs: [
+      ...(task.docs ?? []).map((d) => ({ ...docOf(d), from: null })),
+      ...rootFirst.flatMap((a) =>
+        (a.docs ?? []).map((d) => ({
+          ...docOf(d),
+          from: { id: a.id, title: a.title, level: levelOf(a) },
+        })),
+      ),
+    ],
+    decisions: [
+      ...(task.decisions ?? []).map(decision("own", task)),
+      ...ancestors.flatMap((a) =>
+        (a.decisions ?? []).filter((d) => d.raisedFrom?.id === task.id).map(decision("up", a)),
+      ),
+      ...ancestors.flatMap((a) =>
+        (a.decisions ?? [])
+          .filter((d) => d.raisedFrom?.id !== task.id)
+          .map(decision("inherited", a)),
+      ),
+    ],
+    repoState: (task.repoState ?? []).map((r) => ({
+      name: r.name,
+      branch: r.branch,
+      head: r.head,
+      upstream: r.upstream,
+      ahead: r.ahead,
+      behind: r.behind,
+      dirty: r.dirty,
+      at: r.at,
     })),
-    decisions,
+    parents: rootFirst.map((a, i) => ({
+      id: a.id,
+      title: a.title,
+      level: levelOf(a),
+      objective: parentHandoffs[i] ? objectiveLine(parentHandoffs[i]) : a.description,
+    })),
+    chats: sessions
+      .filter((x) => !x.supersededBy && x.taskId !== null && tree.has(x.taskId))
+      .map((x) => ({
+        sessionId: x.sessionId,
+        lastPrompt: x.lastPrompt,
+        lastAnswer: x.lastAnswer,
+        branch: x.branch,
+        subfolder: x.subfolder,
+      })),
   };
 }
+
+const docOf = (d: TaskDoc) => ({
+  id: d.id,
+  kind: d.kind,
+  title: d.title,
+  ref: d.ref,
+  note: d.note,
+});
