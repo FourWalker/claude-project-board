@@ -12,11 +12,21 @@ Start Board.cmd           starts the board without Claude (same as /board open)
 ```
 
 ## Install
-At the prompt of a terminal session (once this folder is a GitHub repository):
+Clone it (needs Git and Node.js), then turn the mod on as in
+[Turning the mod on for every chat](#turning-the-mod-on-for-every-chat-without-installing):
+
+```powershell
+git clone https://github.com/FourWalker/claude-project-board.git "C:\Claude Works\Claude Project Board"
+```
+
+Or install it as a plugin at the prompt of a terminal session:
 
 ```
-/plugin install project-board --marketplace <owner>/<repo>
+/plugin install project-board --marketplace FourWalker/claude-project-board
 ```
+
+Boards live in `%USERPROFILE%\.claude-board`, not in this repo. To bring them to another machine, copy that
+folder, then fix any workspace path that differs there with ⚙ on the board.
 
 In a chat, `/board open` starts the board server (needs Node.js) and opens the board in its own window.
 Board Mode's protocol ships inside the mod, so nothing depends on your own CLAUDE.md or settings;
